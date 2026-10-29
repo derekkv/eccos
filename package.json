@@ -6,10 +6,13 @@
   "private": true,
   "workspaces": ["packages/*"],
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "cf-types": "wrangler types",
+    "deploy": "npx wrangler deploy",
+    "dev": "npx wrangler dev",
+    "cf-types": "npx wrangler types",
     "test:workers": "vitest run"
+  },
+  "devDependencies": {
+    "wrangler": "^4.20.0"
   },
   "dependencies": {
     "@eccos/core": "workspace:*",
