@@ -19,7 +19,7 @@
   // working endpoints agree for App Review. See docs/deployment.md →
   // "Cutover — moving the Meta-facing origin to a custom domain".
   "routes": [
-    { "pattern": "api.eccos.chat", "custom_domain": true }
+    { "pattern": "wp.catalii.com", "custom_domain": true }
   ],
 
   // Deliberately kept on through the cutover: the workers.dev origin stays a
