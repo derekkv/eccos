@@ -4,6 +4,7 @@
   "description": "Eccos Cloudflare Workers target — Hono + EccosGateway Durable Object.",
   "type": "module",
   "private": true,
+  "workspaces": ["packages/*"],
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",

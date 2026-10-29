@@ -1,0 +1,10 @@
+{
+  "name": "@eccos/gateway-contract",
+  "version": "0.1.0",
+  "description": "Eccos gateway operator RPC contract — the GatewayRPC types plus the pure WABA selection, shared by the gateway and dashboard Workers.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./select-waba": "./src/select-waba.ts"
+  }
+}
