@@ -1,0 +1,2031 @@
+import { DurableObject } from "cloudflare:workers";
+import type {
+  ProvisioningStatus,
+} from "@eccos/gateway-contract";
+import {
+  coexistenceSyncStatus,
+  historySyncDeadline,
+  isWabaOnboardingType,
+  syncUnavailableError,
+  syncUnavailableMarker,
+  HISTORY_SYNC_EXPIRED_ERROR,
+  SYNC_UNCONFIRMED_ERROR,
+  type CoexistenceState,
+  type CoexistenceSyncStatus,
+  type WabaOnboardingType,
+} from "./coexistence";
+import {
+  SEALED_TOKEN_PREFIX,
+  openToken,
+  requireTokenEncryptionKey,
+  sealToken,
+  wabaTokenAad,
+} from "./token-crypto";
+import { AWAITING_PHONE_NUMBER_ERROR } from "./provisioning-messages";
+
+/**
+ * Control plane of the account-scoped gateway.
+ *
+ * Message data stays in the per-WABA `EccosGateway` Durable Objects; account
+ * ownership, API keys, WABA registration and the Embedded Signup connect flow
+ * live here, in one Durable Object. RPC-only — never exposed as public HTTP.
+ *
+ * Secrets policy: only SHA-256 hashes of API keys are stored; a raw key exists
+ * exactly once, in the `createAccount`/`issueApiKey` return value. Meta access
+ * tokens must be presented to the Meta Graph API from the control plane, so
+ * they cannot be hashed — they are encrypted instead (`src/token-crypto.ts`,
+ * AES-256-GCM under a key derived from the `ECCOS_TOKEN_ENCRYPTION_KEY` Worker
+ * secret) and `wabas.meta_access_token` only ever holds the `ecs1.` envelope.
+ * Sealing happens in exactly one place (`prepareWabas`) and opening in exactly
+ * one place (`decryptStoredToken`); no other code path may touch the column.
+ */
+export const API_KEY_PREFIX = "ek_";
+export const API_KEY_RAW_BYTES = 32;
+/** Meta WABA / phone-number ids are numeric; the existing gateway routing
+ * (`gatewayObjectName`) already accepts `[A-Za-z0-9_-]+`, so keep that same
+ * alphabet here. */
+export const WABA_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+export const ACCOUNT_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+export const STATE_MAX_LENGTH = 512;
+/** Bound on the stored OAuth redirect_uri / console return URL. */
+export const URL_MAX_LENGTH = 1024;
+const PHONE_NUMBER_ID_PATTERN = /^[A-Za-z0-9_:-]+$/;
+const MAX_NAME_LENGTH = 200;
+const PROVISIONING_MAX_ATTEMPTS = 6;
+const PROVISIONING_LEASE_MS = 60_000;
+/** Exported for tests: a claim that survives `completeWabaProvisioning` is a
+ * no-op unless the row still matches the claim's revision and attempt. */
+export const PROVISIONING_MAX_ATTEMPTS_AT_RUNTIME = PROVISIONING_MAX_ATTEMPTS;
+export const PROVISIONING_LEASE_MS_AT_RUNTIME = PROVISIONING_LEASE_MS;
+const PROVISIONING_BATCH = 20;
+const PROVISIONING_RETRY_BASE_MS = 5_000;
+const PROVISIONING_RETRY_MAX_MS = 3_600_000;
+const ORGANIZATION_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+const ORGANIZATION_ID_MAX_LENGTH = 128;
+
+/** Public shape of an account; never carries credentials. */
+export interface AccountRecord {
+  accountId: string;
+  name: string;
+  createdAt: number;
+}
+
+/** Stored API-key row. `hash` is SHA-256 of the raw key — never the key itself. */
+export interface AccountAuth {
+  keyId: string;
+  accountId: string;
+  label: string | null;
+  hash: string;
+  createdAt: number;
+  revokedAt: number | null;
+}
+
+/** One registered phone number under a WABA. */
+export interface PhoneRecord {
+  phoneNumberId: string;
+  displayPhoneNumber: string;
+}
+
+/** Owned WABA registration: account_id + credentials + phones. */
+export interface AccountWaba {
+  accountId: string;
+  wabaId: string;
+  metaAccessToken: string;
+  callbackUrl: string | null;
+  createdAt: number;
+  provisionedAt: number | null;
+  status: ProvisioningStatus;
+  provisioningError: string | null;
+  phones: PhoneRecord[];
+  /** Coexistence onboarding obligations and their 24-hour deadline (eccos-vss). */
+  coexistence: CoexistenceState;
+}
+
+/** Ownership metadata of a WABA — every credential is excluded. */
+export interface WabaAccess {
+  accountId: string;
+  wabaId: string;
+  callbackUrl: string | null;
+  createdAt: number;
+  provisionedAt: number | null;
+  status: ProvisioningStatus;
+  provisioningError: string | null;
+  phones: PhoneRecord[];
+  coexistence: CoexistenceState;
+}
+
+export interface CreateAccountResult {
+  account: AccountRecord;
+  apiKey: string;
+  keyId: string;
+}
+
+export interface IssueApiKeyResult {
+  keyId: string;
+  apiKey: string;
+}
+
+export interface RegisterWabaInput {
+  accountId: string;
+  wabaId: string;
+  metaAccessToken: string;
+  callbackUrl?: string;
+  provisioningStatus?: ProvisioningStatus;
+  phones: Array<{ phoneNumberId: string; displayPhoneNumber?: string }>;
+  /**
+   * How this WABA was onboarded. Defaults to `standard`, so only a caller that
+   * actually ran the WhatsApp Business app onboarding flow (`/connect`) opts a
+   * WABA into the coexistence obligations — an omission can never invent one.
+   */
+  onboardingType?: WabaOnboardingType;
+}
+
+export interface RegisterWabaResult {
+  waba: AccountWaba;
+  phones: PhoneRecord[];
+}
+
+export type ProvisioningFailureKind =
+  | "meta"
+  | "gateway"
+  | "configuration"
+  | "unknown"
+  /**
+   * The WABA is connected but carries no business phone number yet.
+   *
+   * Embedded Signup v4 lets a customer finish the flow with a verified, an
+   * unverified, or **no** phone number, where v2 always produced a verified
+   * one. That is not a misconfiguration and not the customer's mistake — it is
+   * a documented completion state — so it is retryable and its message says
+   * what is actually missing rather than blaming the configuration.
+   */
+  | "awaiting_phone_number"
+  /** The coexistence step failed before issuing anything; safe to try again. */
+  | "coexistence"
+  /** A sync was issued and never confirmed. Terminal: Meta allows it only once. */
+  | "coexistence_unconfirmed"
+  /** The 24-hour message-history window closed. Terminal: offboard the customer. */
+  | "coexistence_expired";
+
+export interface ProvisioningFailure {
+  kind: ProvisioningFailureKind;
+  status?: number;
+  retryable: boolean;
+}
+
+export interface WabaProvisioningClaim {
+  accountId: string;
+  wabaId: string;
+  metaAccessToken: string;
+  callbackUrl: string | null;
+  phones: PhoneRecord[];
+  revision: number;
+  attempt: number;
+  /** Coexistence obligations carried into the claim so the saga step needs no
+   * extra control-plane round trip to know what is owed and by when. */
+  coexistence: CoexistenceState;
+}
+
+/** Which of the two coexistence syncs a call refers to. */
+export type CoexistenceSyncKind = "contacts" | "history";
+
+/** Coexistence acceptances recorded alongside a provisioning attempt's outcome. */
+export interface CoexistenceSyncProgress {
+  contactsRequestId: string | null;
+  historyRequestId: string | null;
+  /**
+   * What Meta reported the onboarding actually was, or null while the saga has
+   * not managed to read it. Sticky in storage: it only ever moves from null to
+   * a value, so a later attempt that cannot reach Meta never erases an answer
+   * an earlier one already got.
+   */
+  verifiedOnboardingType: WabaOnboardingType | null;
+  error: string | null;
+}
+
+interface PreparedWaba {
+  accountId: string;
+  wabaId: string;
+  /** `ecs1.` envelope — the plaintext token is never carried past `prepareWabas`. */
+  sealedToken: string;
+  /** SHA-256 of the *plaintext* token: the provisioning fingerprint must stay
+   * stable across re-registrations, and every envelope has a fresh random IV. */
+  tokenHash: string;
+  callbackUrl: string | null;
+  status: ProvisioningStatus;
+  phones: PhoneRecord[];
+  createdAt: number;
+  onboardingType: WabaOnboardingType;
+}
+
+interface ProvisioningRow {
+  account_id: string;
+  waba_id: string;
+  provisioning_revision: number;
+}
+
+export interface ConnectStateRecord {
+  accountId: string;
+  redirectUri: string | null;
+  /** Console URL the gateway sends the operator back to once Meta's callback is
+   * handled. Only set by the dashboard over the RPC service binding, never by a
+   * public HTTP caller — see `startConnectForAccount`. */
+  returnTo: string | null;
+}
+
+export interface ApiKeySummary {
+  keyId: string;
+  label: string | null;
+  createdAt: number;
+  revokedAt: number | null;
+}
+
+export interface AccountResources {
+  account: AccountRecord | null;
+  keys: ApiKeySummary[];
+  wabas: WabaAccess[];
+  phones: Array<PhoneRecord & { wabaId: string }>;
+}
+
+function validateWabaId(wabaId: string, field: string): string {
+  const v = wabaId.trim();
+  if (!WABA_ID_PATTERN.test(v)) {
+    throw new Error(`invalid ${field}: expected letters, digits, "_" or "-"`);
+  }
+  return v;
+}
+
+function validateAccountId(accountId: string): string {
+  const v = accountId.trim();
+  if (!ACCOUNT_ID_PATTERN.test(v)) {
+    throw new Error('invalid accountId: expected letters, digits, "_" or "-"');
+  }
+  return v;
+}
+
+function validateOrganizationId(organizationId: string): string {
+  const v = organizationId?.trim() ?? "";
+  if (!v || v.length > ORGANIZATION_ID_MAX_LENGTH || !ORGANIZATION_ID_PATTERN.test(v)) {
+    throw new Error(
+      `invalid organizationId: expected 1-${ORGANIZATION_ID_MAX_LENGTH} letters, digits, "_" or "-"`,
+    );
+  }
+  return v;
+}
+
+/** Null keeps conversations forever; a number is a retention window in days. */
+export const CONVERSATION_RETENTION_MIN_DAYS = 30;
+export const CONVERSATION_RETENTION_MAX_DAYS = 3650;
+
+function validateConversationRetentionDays(days: number | null): number | null {
+  if (days === null) return null;
+  if (
+    !Number.isInteger(days) ||
+    days < CONVERSATION_RETENTION_MIN_DAYS ||
+    days > CONVERSATION_RETENTION_MAX_DAYS
+  ) {
+    throw new Error(
+      `invalid conversation retention: expected null (keep forever) or an integer from ${CONVERSATION_RETENTION_MIN_DAYS} to ${CONVERSATION_RETENTION_MAX_DAYS} days`,
+    );
+  }
+  return days;
+}
+
+function validateLabel(
+  label: string | null | undefined,
+  field: string,
+): string | null {
+  if (label === undefined || label === null || label.trim() === "") return null;
+  const v = label.trim();
+  if (v.length > MAX_NAME_LENGTH) {
+    throw new Error(`invalid ${field}: at most ${MAX_NAME_LENGTH} characters`);
+  }
+  return v;
+}
+
+/** Keeps the connect state out of URLs and headers (state is attacker-visible
+ * in the OAuth round trip), and bounds the primary-key column. */
+function validateState(state: string | null): string {
+  const v = state?.trim() ?? "";
+  if (!v || v.length > STATE_MAX_LENGTH) {
+    throw new Error(`invalid state: expected 1-${STATE_MAX_LENGTH} characters`);
+  }
+  return v;
+}
+
+function validateCallbackUrl(callbackUrl: string | undefined): string | null {
+  if (
+    callbackUrl === undefined ||
+    callbackUrl === null ||
+    callbackUrl.trim() === ""
+  )
+    return null;
+  const v = callbackUrl.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(v);
+  } catch {
+    throw new Error("invalid callbackUrl: must be a valid URL");
+  }
+  if (parsed.protocol !== "https:")
+    throw new Error("invalid callbackUrl: must use https");
+  if (parsed.username || parsed.password) throw new Error("invalid callbackUrl: credentials are not allowed");
+  if (parsed.hash) throw new Error("invalid callbackUrl: fragments are not allowed");
+  return v;
+}
+
+/** Absolute http(s) URL, https-only off localhost, no embedded credentials.
+ * Shared by the OAuth redirect_uri and the console return URL. */
+function validateAbsoluteUrl(input: string | undefined, field: string): string | null {
+  if (input === undefined || input.trim() === "") return null;
+  const value = input.trim();
+  if (value.length > URL_MAX_LENGTH) {
+    throw new Error(`invalid ${field}: expected at most ${URL_MAX_LENGTH} characters`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`invalid ${field}: must be a valid URL`);
+  }
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname.toLowerCase());
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && local)) {
+    throw new Error(`invalid ${field}: must use https`);
+  }
+  if (parsed.username || parsed.password) throw new Error(`invalid ${field}: credentials are not allowed`);
+  return value;
+}
+
+function validateRedirectUri(redirectUri: string | undefined): string | null {
+  return validateAbsoluteUrl(redirectUri, "redirectUri");
+}
+
+function validateReturnTo(returnTo: string | undefined): string | null {
+  return validateAbsoluteUrl(returnTo, "returnTo");
+}
+
+/** Row -> record, so every read path returns the same shape. */
+function connectStateRecord(row: Record<string, unknown>): ConnectStateRecord {
+  return {
+    accountId: row.account_id as string,
+    redirectUri: (row.redirect_uri as string | null) ?? null,
+    returnTo: (row.return_to as string | null) ?? null,
+  };
+}
+
+function validateProvisioningStatus(status: ProvisioningStatus | undefined): ProvisioningStatus {
+  if (status === undefined) {
+    // Direct registration must be explicit about the row's status: a silent
+    // default would let a caller mark a WABA active without ever provisioning
+    // it. `beginWabaProvisioning*` bypasses this by forcing "pending".
+    throw new Error("provisioningStatus is required for direct WABA registration");
+  }
+  if (status === "pending" || status === "active" || status === "failed") return status;
+  throw new Error("invalid provisioningStatus");
+}
+
+/**
+ * Unlike the provisioning status, an absent onboarding type defaults instead of
+ * throwing — and it defaults to `standard`. The coexistence obligations (and the
+ * 24-hour clock they start) only ever attach to a caller that says so
+ * explicitly, so no registration path can drift a plain WABA into them by
+ * omission (eccos-vss).
+ */
+function validateOnboardingType(value: WabaOnboardingType | undefined): WabaOnboardingType {
+  if (value === undefined) return "standard";
+  if (!isWabaOnboardingType(value)) throw new Error("invalid onboardingType");
+  return value;
+}
+
+function provisioningErrorMessage(failure: ProvisioningFailure): string {
+  if (failure.kind === "meta") {
+    return failure.status === undefined
+      ? "subscribed_apps request failed"
+      : `subscribed_apps failed with HTTP ${failure.status}`;
+  }
+  if (failure.kind === "gateway") return "gateway configuration sync failed";
+  if (failure.kind === "configuration") return "Meta subscription configuration is invalid";
+  if (failure.kind === "awaiting_phone_number") return AWAITING_PHONE_NUMBER_ERROR;
+  // The one an operator has to be able to act on: no retry can help, and the
+  // remedy Meta prescribes is offboarding the customer.
+  if (failure.kind === "coexistence_expired") return HISTORY_SYNC_EXPIRED_ERROR;
+  if (failure.kind === "coexistence_unconfirmed") return SYNC_UNCONFIRMED_ERROR;
+  if (failure.kind === "coexistence") return "coexistence sync could not be started";
+  return "WABA provisioning failed";
+}
+
+function provisioningBackoffMs(attempt: number): number {
+  return Math.min(PROVISIONING_RETRY_BASE_MS * 5 ** Math.max(0, attempt - 1), PROVISIONING_RETRY_MAX_MS);
+}
+
+function withProvisioningJitter(ms: number): number {
+  const spread = ms * 0.1;
+  return Math.round(ms - spread + Math.random() * spread * 2);
+}
+
+/**
+ * Columns every WABA read needs to reconstruct the coexistence state.
+ *
+ * ONE list, and both spellings derived from it. A read that misses a column
+ * does not fail — `coexistenceOf` simply recomputes the status from a `null`
+ * that is not really null, and hands back a confident wrong answer. That is
+ * exactly what happened when `listAccountResources` kept its own hand-written
+ * copy of this list and did not gain `coexistence_verified_type` with the
+ * rest: the console, whose only read path that is, showed `expired` — "offboard
+ * the customer" — on WABAs that owed Meta nothing. So the joined form is
+ * generated rather than written out again.
+ */
+const COEXISTENCE_COLUMN_NAMES = [
+  "onboarding_type",
+  "coexistence_verified_type",
+  "coexistence_sync_status",
+  "coexistence_sync_deadline_at",
+  "coexistence_sync_error",
+  "contacts_sync_started_at",
+  "contacts_sync_request_id",
+  "history_sync_started_at",
+  "history_sync_request_id",
+] as const;
+
+const COEXISTENCE_COLUMNS = COEXISTENCE_COLUMN_NAMES.join(", ");
+
+/** The same columns qualified with a table alias, for the joined reads. */
+function coexistenceColumnsFor(alias: string): string {
+  return COEXISTENCE_COLUMN_NAMES.map((column) => `${alias}.${column}`).join(", ");
+}
+
+function nullableNumber(value: unknown): number | null {
+  return typeof value === "number" ? value : null;
+}
+
+/** Status a freshly written row starts at, before anything has been initiated. */
+function initialCoexistenceStatus(onboardingType: WabaOnboardingType): CoexistenceSyncStatus {
+  return onboardingType === "coexistence" ? "pending" : "not_applicable";
+}
+
+/** A non-coexistence WABA owes nothing, so it carries no deadline at all. */
+function initialCoexistenceDeadline(
+  onboardingType: WabaOnboardingType,
+  onboardedAt: number,
+): number | null {
+  return onboardingType === "coexistence" ? historySyncDeadline(onboardedAt) : null;
+}
+
+/**
+ * Where the 24-hour clock starts, and — just as importantly — where it does not.
+ *
+ * It starts at a *registration*, because every registration is the moment an
+ * Embedded Signup handoff completed, and that handoff is exactly what starts
+ * Meta's window. A genuinely new handoff therefore gets a genuinely new window,
+ * which is what lets a customer who was offboarded be onboarded again.
+ *
+ * It does **not** restart on a retry. `retryWabaProvisioning`,
+ * `claimProvisioning` and `completeWabaProvisioning` never write this column, so
+ * no amount of internal re-attempting hands the customer time Meta is not
+ * giving them. `beginWabaProvisioningBatch` also short-circuits on an unchanged
+ * fingerprint, so a replayed connect callback does not restart it either.
+ */
+function registrationDeadline(
+  onboardingType: WabaOnboardingType,
+  registeredAt: number,
+): number | null {
+  return initialCoexistenceDeadline(onboardingType, registeredAt);
+}
+
+/**
+ * Rebuild the coexistence state from a row.
+ *
+ * The stored `coexistence_sync_status` is what the last write decided; the
+ * deadline, though, keeps running while nothing writes. So `pending` is
+ * re-derived against the clock on every read: a WABA whose window closed at
+ * 02:00 reads as `expired` at 03:00 even if no attempt has run since. The
+ * operator sees the truth, not the last thing that happened to be persisted.
+ */
+function coexistenceOf(row: Record<string, unknown>, now = Date.now()): CoexistenceState {
+  const onboardingType: WabaOnboardingType = isWabaOnboardingType(row.onboarding_type)
+    ? row.onboarding_type
+    : "standard";
+  const contactsStartedAt = nullableNumber(row.contacts_sync_started_at);
+  const contactsRequestId = (row.contacts_sync_request_id as string | null) ?? null;
+  const historyStartedAt = nullableNumber(row.history_sync_started_at);
+  const historyRequestId = (row.history_sync_request_id as string | null) ?? null;
+  const deadlineAt = nullableNumber(row.coexistence_sync_deadline_at);
+  const verifiedOnboardingType: WabaOnboardingType | null = isWabaOnboardingType(
+    row.coexistence_verified_type,
+  )
+    ? row.coexistence_verified_type
+    : null;
+  return {
+    onboardingType,
+    verifiedOnboardingType,
+    status: coexistenceSyncStatus({
+      onboardingType,
+      verifiedOnboardingType,
+      contactsStartedAt,
+      contactsRequestId,
+      historyStartedAt,
+      historyRequestId,
+      deadlineAt,
+      now,
+    }),
+    deadlineAt,
+    contactsStartedAt,
+    contactsRequestId,
+    historyStartedAt,
+    historyRequestId,
+    error: (row.coexistence_sync_error as string | null) ?? null,
+  };
+}
+
+async function sha256Hex(s: string): Promise<string> {
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
+  return [...new Uint8Array(d)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function newApiKey(): string {
+  const bytes = new Uint8Array(API_KEY_RAW_BYTES);
+  crypto.getRandomValues(bytes);
+  const encoded = btoa(String.fromCharCode(...bytes))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/, "");
+  return `${API_KEY_PREFIX}${encoded}`;
+}
+
+function newId(prefix: string): string {
+  return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function phonesOf(wabaId: string, sql: SqlStorage): PhoneRecord[] {
+  return sql
+    .exec(
+      "SELECT phone_number_id, display_phone_number FROM phones WHERE waba_id = ? ORDER BY phone_number_id",
+      wabaId,
+    )
+    .toArray()
+    .map((p) => ({
+      phoneNumberId: p.phone_number_id as string,
+      displayPhoneNumber: (p.display_phone_number as string | null) ?? "",
+    }));
+}
+
+function parsePhonesJson(raw: string): PhoneRecord[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (
+          p,
+        ): p is { phoneNumberId: string; displayPhoneNumber: string | null } =>
+          p !== null &&
+          typeof p === "object" &&
+          typeof (p as { phoneNumberId?: unknown }).phoneNumberId === "string",
+      )
+      .map((p) => ({
+        phoneNumberId: p.phoneNumberId,
+        displayPhoneNumber: p.displayPhoneNumber ?? "",
+      }));
+  } catch {
+    return [];
+  }
+}
+
+/** Stored on a WABA whose `meta_access_token` is not an `ecs1.` envelope. */
+export const UNSEALED_TOKEN_ERROR =
+  "meta access token is not encrypted; reconnect the number";
+
+/**
+ * Rows written before application-layer token encryption existed cannot be
+ * opened: the plaintext is not an envelope and there is deliberately no
+ * plaintext-tolerant read path (Eccos Cloud is multi-tenant by default and
+ * legacy/shadow/dual-path compatibility is forbidden — decision 2026-08-27).
+ *
+ * Rather than migrating them in place, the control plane *quarantines* them on
+ * every Durable Object init: the WABA is marked `failed` with an actionable
+ * error, so the dashboard shows "reconnect the number" instead of failing with
+ * an opaque crypto error deep inside a send. Reconnecting through Embedded
+ * Signup upserts the row with a sealed envelope and clears the quarantine.
+ *
+ * Idempotent: a row already quarantined with this exact error is not rewritten,
+ * so the returned count is 0 on every run after the first.
+ */
+export function quarantineUnsealedWabas(sql: SqlStorage): number {
+  return sql
+    .exec(
+      `UPDATE wabas
+          SET status = 'failed',
+              provisioning_error = ?,
+              provisioning_next_attempt_at = 0,
+              provisioning_lease_until = NULL
+        WHERE substr(meta_access_token, 1, ?) <> ?
+          AND (status <> 'failed' OR provisioning_error IS NOT ?)
+       RETURNING waba_id`,
+      UNSEALED_TOKEN_ERROR,
+      SEALED_TOKEN_PREFIX.length,
+      SEALED_TOKEN_PREFIX,
+      UNSEALED_TOKEN_ERROR,
+    )
+    .toArray().length;
+}
+
+export class EccosControlPlane extends DurableObject<Env> {
+  sql: SqlStorage;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    ctx.blockConcurrencyWhile(async () => {
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS accounts (
+        account_id TEXT PRIMARY KEY,
+        name       TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS api_keys (
+        key_id     TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        label      TEXT,
+        hash       TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        revoked_at INTEGER
+      );`);
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_api_keys_account
+        ON api_keys (account_id);`);
+      this.sql.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_hash
+        ON api_keys (hash);`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS wabas (
+        account_id        TEXT NOT NULL,
+        waba_id           TEXT PRIMARY KEY,
+        meta_access_token TEXT NOT NULL,
+        callback_url      TEXT,
+        created_at        INTEGER NOT NULL,
+        status            TEXT NOT NULL DEFAULT 'active',
+        provisioning_error TEXT,
+        provisioning_attempts INTEGER NOT NULL DEFAULT 0,
+        provisioning_next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        provisioning_lease_until INTEGER,
+        provisioning_revision INTEGER NOT NULL DEFAULT 0,
+        provisioning_fingerprint TEXT,
+        provisioned_at INTEGER,
+        -- Coexistence onboarding obligations (eccos-vss). Provisioning state
+        -- only: what Meta was asked to synchronise and by when it must be. No
+        -- contact ever lands here.
+        onboarding_type TEXT NOT NULL DEFAULT 'standard',
+        coexistence_verified_type TEXT,
+        coexistence_sync_status TEXT NOT NULL DEFAULT 'not_applicable',
+        coexistence_sync_deadline_at INTEGER,
+        coexistence_sync_error TEXT,
+        contacts_sync_started_at INTEGER,
+        contacts_sync_request_id TEXT,
+        history_sync_started_at INTEGER,
+        history_sync_request_id TEXT
+      );`);
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_wabas_account
+        ON wabas (account_id);`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS phones (
+        waba_id              TEXT NOT NULL,
+        phone_number_id      TEXT PRIMARY KEY,
+        display_phone_number TEXT NOT NULL
+      );`);
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_phones_waba
+        ON phones (waba_id);`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS connect_states (
+        state      TEXT PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        redirect_uri TEXT,
+        return_to  TEXT
+      );`);
+      // Identity-plane link (docs/auth-tenancy-contract.md section 2): one Better
+      // Auth organization <-> one Eccos account. PRIMARY KEY on organization_id +
+      // UNIQUE on account_id enforce the one-to-one mapping at the storage layer;
+      // the link is immutable - it is never re-pointed, only created or read.
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS organization_accounts (
+        organization_id TEXT PRIMARY KEY,
+        account_id      TEXT NOT NULL UNIQUE,
+        status          TEXT NOT NULL DEFAULT 'active',
+        created_at      INTEGER NOT NULL
+      );`);
+      // NULL is the default and means keep forever (see `setConversationRetentionDays`).
+      const accountColumns = this.sql.exec("PRAGMA table_info(accounts)").toArray();
+      if (!accountColumns.some((row) => row.name === "conversation_retention_days")) {
+        this.sql.exec("ALTER TABLE accounts ADD COLUMN conversation_retention_days INTEGER");
+      }
+      const wabaColumns = this.sql.exec("PRAGMA table_info(wabas)").toArray();
+      if (!wabaColumns.some((row) => row.name === "status")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN status TEXT NOT NULL DEFAULT 'active'");
+      }
+      if (!wabaColumns.some((row) => row.name === "provisioning_error")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN provisioning_error TEXT");
+      }
+      if (!wabaColumns.some((row) => row.name === "provisioning_attempts")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN provisioning_attempts INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!wabaColumns.some((row) => row.name === "provisioning_next_attempt_at")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN provisioning_next_attempt_at INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!wabaColumns.some((row) => row.name === "provisioning_lease_until")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN provisioning_lease_until INTEGER");
+      }
+      if (!wabaColumns.some((row) => row.name === "provisioning_revision")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN provisioning_revision INTEGER NOT NULL DEFAULT 0");
+      }
+      if (!wabaColumns.some((row) => row.name === "provisioning_fingerprint")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN provisioning_fingerprint TEXT");
+      }
+      if (!wabaColumns.some((row) => row.name === "provisioned_at")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN provisioned_at INTEGER");
+      }
+      // Coexistence obligations (eccos-vss). Rows written before this existed
+      // default to `standard`/`not_applicable`: a WABA that predates the column
+      // is never retro-fitted with a 24-hour clock that already ran out, which
+      // would fail every one of them at once. Reconnecting through Embedded
+      // Signup is what records a real coexistence onboarding and its deadline.
+      if (!wabaColumns.some((row) => row.name === "onboarding_type")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN onboarding_type TEXT NOT NULL DEFAULT 'standard'");
+      }
+      // Null on every existing row, which is exactly right: nothing has been
+      // verified yet, and a WABA registered before this column existed is a
+      // WABA whose asserted coexistence was never checked against Meta.
+      if (!wabaColumns.some((row) => row.name === "coexistence_verified_type")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN coexistence_verified_type TEXT");
+      }
+      if (!wabaColumns.some((row) => row.name === "coexistence_sync_status")) {
+        this.sql.exec(
+          "ALTER TABLE wabas ADD COLUMN coexistence_sync_status TEXT NOT NULL DEFAULT 'not_applicable'",
+        );
+      }
+      if (!wabaColumns.some((row) => row.name === "coexistence_sync_deadline_at")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN coexistence_sync_deadline_at INTEGER");
+      }
+      if (!wabaColumns.some((row) => row.name === "coexistence_sync_error")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN coexistence_sync_error TEXT");
+      }
+      if (!wabaColumns.some((row) => row.name === "contacts_sync_started_at")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN contacts_sync_started_at INTEGER");
+      }
+      if (!wabaColumns.some((row) => row.name === "contacts_sync_request_id")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN contacts_sync_request_id TEXT");
+      }
+      if (!wabaColumns.some((row) => row.name === "history_sync_started_at")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN history_sync_started_at INTEGER");
+      }
+      if (!wabaColumns.some((row) => row.name === "history_sync_request_id")) {
+        this.sql.exec("ALTER TABLE wabas ADD COLUMN history_sync_request_id TEXT");
+      }
+      const stateColumns = this.sql.exec("PRAGMA table_info(connect_states)").toArray();
+      if (!stateColumns.some((row) => row.name === "redirect_uri")) {
+        this.sql.exec("ALTER TABLE connect_states ADD COLUMN redirect_uri TEXT");
+      }
+      if (!stateColumns.some((row) => row.name === "return_to")) {
+        this.sql.exec("ALTER TABLE connect_states ADD COLUMN return_to TEXT");
+      }
+      this.sql.exec(`CREATE INDEX IF NOT EXISTS idx_wabas_provisioning
+        ON wabas (status, provisioning_next_attempt_at);`);
+      // Fail-closed cut-over for rows predating token encryption: quarantine,
+      // never migrate — there is no plaintext read path.
+      quarantineUnsealedWabas(this.sql);
+    });
+  }
+
+  /** The one place a stored envelope is opened. Every caller that needs the
+   * plaintext token goes through here, so the crypto never spreads out into
+   * the routes, the RPC entrypoint, or the provisioning loop. */
+  private async decryptStoredToken(
+    accountId: string,
+    wabaId: string,
+    stored: unknown,
+  ): Promise<string> {
+    if (typeof stored !== "string" || stored === "") {
+      throw new Error(`WABA "${wabaId}" has no stored meta access token`);
+    }
+    if (!stored.startsWith(SEALED_TOKEN_PREFIX)) {
+      throw new Error(`WABA "${wabaId}": ${UNSEALED_TOKEN_ERROR}`);
+    }
+    const secret = requireTokenEncryptionKey(this.env);
+    return openToken(secret, wabaTokenAad(accountId, wabaId), stored);
+  }
+
+  async createAccount(
+    input: { accountId?: string; name?: string } = {},
+  ): Promise<CreateAccountResult> {
+    const accountId = validateAccountId(input.accountId ?? newId("acc"));
+    const name = validateLabel(input.name ?? null, "name") ?? "";
+    const createdAt = Date.now();
+    const apiKey = newApiKey();
+    const keyId = newId("key");
+    const hash = await sha256Hex(apiKey);
+
+    // The existence check lives inside the transaction so two concurrent
+    // `createAccount` calls for the same id cannot both pass the pre-check.
+    this.ctx.storage.transactionSync(() => {
+      const existing = this.sql
+        .exec("SELECT 1 FROM accounts WHERE account_id = ?", accountId)
+        .toArray();
+      if (existing.length > 0)
+        throw new Error(`account "${accountId}" already exists`);
+      this.sql.exec(
+        "INSERT INTO accounts (account_id, name, created_at) VALUES (?, ?, ?)",
+        accountId,
+        name,
+        createdAt,
+      );
+      this.sql.exec(
+        "INSERT INTO api_keys (key_id, account_id, label, hash, created_at, revoked_at) VALUES (?, ?, NULL, ?, ?, NULL)",
+        keyId,
+        accountId,
+        hash,
+        createdAt,
+      );
+    });
+
+    return { account: { accountId, name, createdAt }, apiKey, keyId };
+  }
+
+  async issueApiKey(
+    accountId: string,
+    label?: string,
+  ): Promise<IssueApiKeyResult> {
+    const id = this.requireAccount(accountId);
+    const cleanLabel = validateLabel(label ?? null, "label");
+    const apiKey = newApiKey();
+    const keyId = newId("key");
+    const hash = await sha256Hex(apiKey);
+    this.sql.exec(
+      "INSERT INTO api_keys (key_id, account_id, label, hash, created_at, revoked_at) VALUES (?, ?, ?, ?, ?, NULL)",
+      keyId,
+      id,
+      cleanLabel,
+      hash,
+      Date.now(),
+    );
+    return { keyId, apiKey };
+  }
+
+  /** Returns true only when the key existed, was owned by `accountId`, and was
+   * not already revoked. */
+  revokeApiKey(accountId: string, keyId: string): boolean {
+    const id = this.requireAccount(accountId);
+    const revoked = this.sql
+      .exec(
+        "UPDATE api_keys SET revoked_at = ? WHERE key_id = ? AND account_id = ? AND revoked_at IS NULL RETURNING key_id",
+        Date.now(),
+        keyId,
+        id,
+      )
+      .toArray();
+    return revoked.length > 0;
+  }
+
+  /** The workspace's conversation retention in days; null keeps them forever. */
+  getConversationRetentionDays(accountId: string): number | null {
+    return this.conversationRetentionOf(this.requireAccount(accountId));
+  }
+
+  /** The retention of the account that owns a WABA, asked by the WABA's gateway on
+   * its retention tick. Throws for an unknown WABA, so the caller deletes nothing. */
+  getConversationRetentionDaysForWaba(wabaId: string): number | null {
+    const id = validateWabaId(wabaId, "wabaId");
+    const row = this.sql
+      .exec(
+        "SELECT a.conversation_retention_days AS days FROM wabas w JOIN accounts a ON a.account_id = w.account_id WHERE w.waba_id = ?",
+        id,
+      )
+      .toArray()[0];
+    if (!row) throw new Error(`WABA ${id} does not exist`);
+    return (row.days as number | null) ?? null;
+  }
+
+  /** The plaintext Meta token of a WABA, for its gateway's media downloads on the alarm.
+   * Asked by the WABA's own Durable Object by name, so no account id is needed.
+   * Null for a WABA the control plane does not know. The token is never stored in the gateway object. */
+  async getMetaAccessTokenForWaba(wabaId: string): Promise<string | null> {
+    const id = validateWabaId(wabaId, "wabaId");
+    const row = this.sql
+      .exec("SELECT account_id, meta_access_token FROM wabas WHERE waba_id = ?", id)
+      .toArray()[0];
+    if (!row) return null;
+    return this.decryptStoredToken(row.account_id as string, id, row.meta_access_token);
+  }
+
+  /** Stores the retention and returns it. */
+  setConversationRetentionDays(accountId: string, days: number | null): number | null {
+    const id = this.requireAccount(accountId);
+    const value = validateConversationRetentionDays(days);
+    this.sql.exec(
+      "UPDATE accounts SET conversation_retention_days = ? WHERE account_id = ?",
+      value,
+      id,
+    );
+    return value;
+  }
+
+  private conversationRetentionOf(accountId: string): number | null {
+    const row = this.sql
+      .exec("SELECT conversation_retention_days AS days FROM accounts WHERE account_id = ?", accountId)
+      .toArray()[0];
+    return (row?.days as number | null) ?? null;
+  }
+
+  /** Key metadata of one account; the hash never leaves this method. */
+  listApiKeys(accountId: string): ApiKeySummary[] {
+    return this.keysOf(this.requireAccount(accountId));
+  }
+
+  private keysOf(accountId: string): ApiKeySummary[] {
+    return this.sql
+      .exec(
+        "SELECT key_id, label, created_at, revoked_at FROM api_keys WHERE account_id = ? ORDER BY key_id",
+        accountId,
+      )
+      .toArray()
+      .map((row) => ({
+        keyId: row.key_id as string,
+        label: row.label as string | null,
+        createdAt: row.created_at as number,
+        revokedAt: row.revoked_at as number | null,
+      }));
+  }
+
+  /** Resolves an API key to its owner. Revoked keys fail closed (return null). */
+  async authenticateApiKey(
+    raw: string,
+  ): Promise<{ accountId: string; keyId: string } | null> {
+    if (!raw || typeof raw !== "string" || !raw.startsWith(API_KEY_PREFIX))
+      return null;
+    const hash = await sha256Hex(raw);
+    const row = this.sql
+      .exec(
+        "SELECT key_id, account_id FROM api_keys WHERE hash = ? AND revoked_at IS NULL",
+        hash,
+      )
+      .toArray()[0];
+    if (!row) return null;
+    return { accountId: row.account_id as string, keyId: row.key_id as string };
+  }
+
+  async registerWaba(input: RegisterWabaInput): Promise<RegisterWabaResult> {
+    const result = (await this.registerWabas([input]))[0];
+    if (!result) throw new Error("WABA registration failed");
+    return result;
+  }
+
+  /** The one place a Meta access token is sealed. Validation is unchanged; the
+   * plaintext exists only inside this function and is replaced by the `ecs1.`
+   * envelope (plus a fingerprint hash) before anything is written. */
+  private async prepareWabas(
+    inputs: RegisterWabaInput[],
+    forcedStatus?: ProvisioningStatus,
+  ): Promise<PreparedWaba[]> {
+    if (inputs.length === 0) return [];
+    const secret = requireTokenEncryptionKey(this.env);
+    const prepared = await Promise.all(inputs.map(async (input) => {
+      const accountId = this.requireAccount(input.accountId);
+      const wabaId = validateWabaId(input.wabaId, "wabaId");
+      const metaAccessToken = input.metaAccessToken.trim();
+      if (!metaAccessToken) throw new Error("invalid metaAccessToken: must not be empty");
+      const callbackUrl = validateCallbackUrl(input.callbackUrl);
+      const status = forcedStatus ?? validateProvisioningStatus(input.provisioningStatus);
+      const phones = input.phones ?? [];
+      // Embedded Signup v4 lets a customer finish the flow with no business
+      // phone number at all, so a registration that names none is a real
+      // outcome rather than a malformed call — but only on the provisioning
+      // path, which starts `pending` and adopts a number once one appears. A
+      // registration that declares a WABA already `active` must still name the
+      // number it is active with, so "active implies a usable number" holds.
+      if (phones.length === 0 && status !== "pending") {
+        throw new Error("invalid phones: at least one phone is required");
+      }
+      const checkedPhones: PhoneRecord[] = [];
+      const seenPhoneIds = new Set<string>();
+      for (const phone of phones) {
+        const phoneNumberId = phone.phoneNumberId.trim();
+        if (!PHONE_NUMBER_ID_PATTERN.test(phoneNumberId)) {
+          throw new Error('invalid phoneNumberId: expected letters, digits, "_", ":" or "-"');
+        }
+        if (seenPhoneIds.has(phoneNumberId)) throw new Error(`duplicate phoneNumberId "${phoneNumberId}"`);
+        seenPhoneIds.add(phoneNumberId);
+        checkedPhones.push({ phoneNumberId, displayPhoneNumber: phone.displayPhoneNumber?.trim() || "" });
+      }
+      const [sealedToken, tokenHash] = await Promise.all([
+        sealToken(secret, wabaTokenAad(accountId, wabaId), metaAccessToken),
+        sha256Hex(metaAccessToken),
+      ]);
+      return {
+        accountId,
+        wabaId,
+        sealedToken,
+        tokenHash,
+        callbackUrl,
+        status,
+        phones: checkedPhones,
+        createdAt: Date.now(),
+        onboardingType: validateOnboardingType(input.onboardingType),
+      };
+    }));
+    const seenWabaIds = new Set<string>();
+    const seenPhoneIds = new Set<string>();
+    for (const item of prepared) {
+      if (seenWabaIds.has(item.wabaId)) throw new Error(`duplicate wabaId "${item.wabaId}"`);
+      seenWabaIds.add(item.wabaId);
+      for (const phone of item.phones) {
+        if (seenPhoneIds.has(phone.phoneNumberId)) throw new Error(`duplicate phoneNumberId "${phone.phoneNumberId}"`);
+        seenPhoneIds.add(phone.phoneNumberId);
+      }
+    }
+    return prepared;
+  }
+
+  private assertWabaOwnership(prepared: PreparedWaba[]): void {
+    for (const item of prepared) {
+      const waba = this.sql
+        .exec("SELECT account_id, created_at FROM wabas WHERE waba_id = ?", item.wabaId)
+        .toArray()[0];
+      if (waba && waba.account_id !== item.accountId) {
+        throw new Error(`waba "${item.wabaId}" is already registered to another account`);
+      }
+      if (waba) item.createdAt = waba.created_at as number;
+      for (const phone of item.phones) {
+        const owner = this.sql
+          .exec(
+            `SELECT p.waba_id, w.account_id FROM phones p
+             JOIN wabas w ON w.waba_id = p.waba_id
+             WHERE p.phone_number_id = ?`,
+            phone.phoneNumberId,
+          )
+          .toArray()[0];
+        if (!owner || (owner.waba_id === item.wabaId && owner.account_id === item.accountId)) continue;
+        if (owner.account_id !== item.accountId) {
+          throw new Error(`phone "${phone.phoneNumberId}" is already registered to another account`);
+        }
+        throw new Error(`phone "${phone.phoneNumberId}" is already registered to WABA "${owner.waba_id}"`);
+      }
+    }
+  }
+
+  async registerWabas(inputs: RegisterWabaInput[]): Promise<RegisterWabaResult[]> {
+    const prepared = await this.prepareWabas(inputs);
+    if (prepared.length === 0) return [];
+    const registeredAt = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.assertWabaOwnership(prepared);
+      for (const item of prepared) {
+        this.sql.exec(
+          `INSERT INTO wabas
+             (account_id, waba_id, meta_access_token, callback_url, created_at, status,
+              provisioning_error, provisioning_attempts, provisioning_next_attempt_at,
+              provisioning_lease_until, provisioning_revision, provisioning_fingerprint, provisioned_at,
+              onboarding_type, coexistence_sync_status, coexistence_sync_deadline_at,
+              coexistence_sync_error, contacts_sync_started_at, contacts_sync_request_id,
+              history_sync_started_at, history_sync_request_id)
+           VALUES (?, ?, ?, ?, ?, ?, NULL, 0, 0, NULL, 1, NULL, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)
+           ON CONFLICT(waba_id) DO UPDATE SET
+             account_id = excluded.account_id,
+             meta_access_token = excluded.meta_access_token,
+             callback_url = COALESCE(excluded.callback_url, wabas.callback_url),
+             status = excluded.status,
+             provisioning_error = NULL,
+             provisioning_attempts = 0,
+             provisioning_next_attempt_at = 0,
+             provisioning_lease_until = NULL,
+             provisioning_revision = wabas.provisioning_revision + 1,
+             provisioning_fingerprint = NULL,
+             provisioned_at = CASE
+               WHEN excluded.status = 'active' THEN COALESCE(wabas.provisioned_at, excluded.provisioned_at)
+               ELSE NULL
+             END,
+             onboarding_type = excluded.onboarding_type,
+             -- Cleared with the rest of the coexistence state: a re-registration
+             -- is a *new* Embedded Signup handoff, so last time's verdict says
+             -- nothing about this number's new onboarding and must be re-read.
+             coexistence_verified_type = NULL,
+             coexistence_sync_status = excluded.coexistence_sync_status,
+             coexistence_sync_deadline_at = excluded.coexistence_sync_deadline_at,
+             coexistence_sync_error = NULL,
+             contacts_sync_started_at = NULL,
+             contacts_sync_request_id = NULL,
+             history_sync_started_at = NULL,
+             history_sync_request_id = NULL`,
+          item.accountId,
+          item.wabaId,
+          item.sealedToken,
+          item.callbackUrl,
+          item.createdAt,
+          item.status,
+          item.onboardingType,
+          initialCoexistenceStatus(item.onboardingType),
+          // `item.createdAt` is rewritten to the row's original creation time on
+          // a conflict, so the clock is read here instead of from the item.
+          registrationDeadline(item.onboardingType, registeredAt),
+        );
+        for (const phone of item.phones) {
+          this.sql.exec(
+            "INSERT OR REPLACE INTO phones (waba_id, phone_number_id, display_phone_number) VALUES (?, ?, ?)",
+            item.wabaId,
+            phone.phoneNumberId,
+            phone.displayPhoneNumber,
+          );
+        }
+      }
+    });
+    return Promise.all(prepared.map(async (item) => {
+      const waba = await this.getWabaRecord(item.accountId, item.wabaId);
+      if (!waba) throw new Error(`WABA registration failed for "${item.wabaId}"`);
+      return { waba, phones: waba.phones };
+    }));
+  }
+
+  async beginWabaProvisioning(input: RegisterWabaInput): Promise<RegisterWabaResult> {
+    const result = (await this.beginWabaProvisioningBatch([input]))[0];
+    if (!result) throw new Error("WABA provisioning failed");
+    return result;
+  }
+
+  async beginWabaProvisioningBatch(inputs: RegisterWabaInput[]): Promise<RegisterWabaResult[]> {
+    const prepared = await this.prepareWabas(inputs, "pending");
+    if (prepared.length === 0) return [];
+    if (prepared.some((item) => item.callbackUrl === null)) {
+      throw new Error("callbackUrl is required for WABA provisioning");
+    }
+    const fingerprints = await Promise.all(
+      prepared.map(async (item) =>
+        sha256Hex(
+          JSON.stringify({
+            wabaId: item.wabaId,
+            // Hash of the plaintext, not of the envelope: two registrations of
+            // the same token must produce the same fingerprint (the envelope
+            // carries a fresh IV every time), or provisioning stops being
+            // idempotent and re-subscribes Meta on every retry.
+            tokenHash: item.tokenHash,
+            callbackUrl: item.callbackUrl,
+            phones: [...item.phones].sort((a, b) => a.phoneNumberId.localeCompare(b.phoneNumberId)),
+          }),
+        ),
+      ),
+    );
+    const now = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      this.assertWabaOwnership(prepared);
+      for (const [index, item] of prepared.entries()) {
+        const fingerprint = fingerprints[index];
+        if (!fingerprint) throw new Error(`WABA provisioning fingerprint failed for "${item.wabaId}"`);
+        const existing = this.sql
+          .exec(
+            "SELECT status, provisioning_fingerprint, provisioning_revision FROM wabas WHERE waba_id = ? AND account_id = ?",
+            item.wabaId,
+            item.accountId,
+          )
+          .toArray()[0];
+        if (
+          existing?.provisioning_fingerprint === fingerprint &&
+          existing.status !== "failed"
+        ) continue;
+        const revision = Number(existing?.provisioning_revision ?? 0) + 1;
+        this.sql.exec(
+          `INSERT INTO wabas
+             (account_id, waba_id, meta_access_token, callback_url, created_at, status,
+              provisioning_error, provisioning_attempts, provisioning_next_attempt_at,
+              provisioning_lease_until, provisioning_revision, provisioning_fingerprint, provisioned_at,
+              onboarding_type, coexistence_sync_status, coexistence_sync_deadline_at,
+              coexistence_sync_error, contacts_sync_started_at, contacts_sync_request_id,
+              history_sync_started_at, history_sync_request_id)
+           VALUES (?, ?, ?, ?, ?, 'pending', NULL, 0, ?, NULL, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL, NULL, NULL)
+           ON CONFLICT(waba_id) DO UPDATE SET
+             account_id = excluded.account_id,
+             meta_access_token = excluded.meta_access_token,
+             callback_url = excluded.callback_url,
+             status = 'pending',
+             provisioning_error = NULL,
+             provisioning_attempts = 0,
+             provisioning_next_attempt_at = excluded.provisioning_next_attempt_at,
+             provisioning_lease_until = NULL,
+             provisioning_revision = excluded.provisioning_revision,
+             provisioning_fingerprint = excluded.provisioning_fingerprint,
+             provisioned_at = NULL,
+             onboarding_type = excluded.onboarding_type,
+             -- Cleared with the rest of the coexistence state: a re-registration
+             -- is a *new* Embedded Signup handoff, so last time's verdict says
+             -- nothing about this number's new onboarding and must be re-read.
+             coexistence_verified_type = NULL,
+             coexistence_sync_status = excluded.coexistence_sync_status,
+             coexistence_sync_deadline_at = excluded.coexistence_sync_deadline_at,
+             coexistence_sync_error = NULL,
+             contacts_sync_started_at = NULL,
+             contacts_sync_request_id = NULL,
+             history_sync_started_at = NULL,
+             history_sync_request_id = NULL`,
+          item.accountId,
+          item.wabaId,
+          item.sealedToken,
+          item.callbackUrl,
+          item.createdAt,
+          now,
+          revision,
+          fingerprint,
+          item.onboardingType,
+          initialCoexistenceStatus(item.onboardingType),
+          registrationDeadline(item.onboardingType, now),
+        );
+        // An empty phone set means the handoff told us nothing about numbers —
+        // a v4 completion without one — not that the WABA's existing numbers
+        // are gone. Pruning on that would let a reconnect that happened to see
+        // no numbers wipe a working WABA's, so it is only ever done when the
+        // handoff actually named some.
+        if (item.phones.length > 0) {
+          const retainedPhones = new Set(item.phones.map((phone) => phone.phoneNumberId));
+          for (const row of this.sql.exec("SELECT phone_number_id FROM phones WHERE waba_id = ?", item.wabaId).toArray()) {
+            if (!retainedPhones.has(row.phone_number_id as string)) {
+              this.sql.exec("DELETE FROM phones WHERE waba_id = ? AND phone_number_id = ?", item.wabaId, row.phone_number_id);
+            }
+          }
+        }
+        for (const phone of item.phones) {
+          this.sql.exec(
+            "INSERT OR REPLACE INTO phones (waba_id, phone_number_id, display_phone_number) VALUES (?, ?, ?)",
+            item.wabaId,
+            phone.phoneNumberId,
+            phone.displayPhoneNumber,
+          );
+        }
+      }
+    });
+    return Promise.all(prepared.map(async (item) => {
+      const waba = await this.getWabaRecord(item.accountId, item.wabaId);
+      if (!waba) throw new Error(`WABA provisioning failed for "${item.wabaId}"`);
+      return { waba, phones: waba.phones };
+    }));
+  }
+
+  /** Full registration incl. credentials + phones — only for the owning account.
+   * Non-active registrations resolve to `null` *before* the token is opened, so
+   * a quarantined row reads as "not configured" instead of throwing here. */
+  async getWaba(accountId: string, wabaId: string): Promise<AccountWaba | null> {
+    const row = this.readWabaRow(accountId, wabaId);
+    if (!row || ((row.status as ProvisioningStatus) ?? "active") !== "active") return null;
+    return this.hydrateWaba(row);
+  }
+
+  async getWabaRecord(accountId: string, wabaId: string): Promise<AccountWaba | null> {
+    const row = this.readWabaRow(accountId, wabaId);
+    return row ? this.hydrateWaba(row) : null;
+  }
+
+  /** Raw owned row, credentials still sealed. */
+  private readWabaRow(accountId: string, wabaId: string): Record<string, unknown> | null {
+    const id = validateAccountId(accountId);
+    const owned = this.sql
+      .exec("SELECT account_id FROM accounts WHERE account_id = ?", id)
+      .toArray()[0];
+    if (!owned) return null;
+    const wabaIdN = validateWabaId(wabaId, "wabaId");
+    const row = this.sql
+      .exec(
+        `SELECT account_id, waba_id, meta_access_token, callback_url, created_at, provisioned_at, status, provisioning_error, ${COEXISTENCE_COLUMNS} FROM wabas WHERE waba_id = ? AND account_id = ?`,
+        wabaIdN,
+        id,
+      )
+      .toArray()[0];
+    return row ?? null;
+  }
+
+  private async hydrateWaba(row: Record<string, unknown>): Promise<AccountWaba> {
+    const accountId = row.account_id as string;
+    const wabaId = row.waba_id as string;
+    return {
+      accountId,
+      wabaId,
+      metaAccessToken: await this.decryptStoredToken(accountId, wabaId, row.meta_access_token),
+      callbackUrl: (row.callback_url as string | null) ?? null,
+      createdAt: row.created_at as number,
+      provisionedAt: (row.provisioned_at as number | null) ?? null,
+      status: (row.status as ProvisioningStatus) ?? "active",
+      provisioningError: (row.provisioning_error as string | null) ?? null,
+      phones: phonesOf(wabaId, this.sql),
+      coexistence: coexistenceOf(row),
+    };
+  }
+
+  /** Ownership metadata only — never the access token. */
+  getWabaById(wabaId: string): WabaAccess | null {
+    const wabaIdN = validateWabaId(wabaId, "wabaId");
+    const row = this.sql
+      .exec(
+        `SELECT account_id, waba_id, callback_url, created_at, provisioned_at, status, provisioning_error, ${COEXISTENCE_COLUMNS} FROM wabas WHERE waba_id = ?`,
+        wabaIdN,
+      )
+      .toArray()[0];
+    if (!row) return null;
+    return {
+      accountId: row.account_id as string,
+      wabaId: row.waba_id as string,
+      callbackUrl: (row.callback_url as string | null) ?? null,
+      createdAt: row.created_at as number,
+      provisionedAt: (row.provisioned_at as number | null) ?? null,
+      status: (row.status as ProvisioningStatus) ?? "active",
+      provisioningError: (row.provisioning_error as string | null) ?? null,
+      phones: phonesOf(wabaIdN, this.sql),
+      coexistence: coexistenceOf(row),
+    };
+  }
+
+  async retryWabaProvisioning(accountId: string, wabaId: string): Promise<AccountWaba | null> {
+    const account = this.requireAccount(accountId);
+    const id = validateWabaId(wabaId, "wabaId");
+    const now = Date.now();
+    this.sql.exec(
+      // `coexistence_sync_deadline_at` and the two `*_sync_started_at` columns
+      // are deliberately untouched: a retry is not a new onboarding, so it must
+      // not buy the customer more of Meta's 24 hours, and it must not re-issue a
+      // sync that already landed. Only the recorded failure is cleared, so a
+      // requeued row reads as "pending, nothing failed yet" (eccos-vss).
+      `UPDATE wabas
+       SET status = 'pending', provisioning_error = NULL, provisioning_attempts = 0,
+           provisioning_next_attempt_at = ?, provisioning_lease_until = NULL,
+           provisioning_revision = provisioning_revision + 1, provisioned_at = NULL,
+           coexistence_sync_error = NULL
+       WHERE account_id = ? AND waba_id = ? AND status IN ('pending', 'failed')
+         AND substr(meta_access_token, 1, ?) = ?`,
+      now,
+      account,
+      id,
+      SEALED_TOKEN_PREFIX.length,
+      SEALED_TOKEN_PREFIX,
+    );
+    // A quarantined WABA stays `failed`: retrying it could never succeed, and
+    // `getWabaRecord` below surfaces the actionable "reconnect the number".
+    return this.getWabaRecord(account, id);
+  }
+
+  async claimWabaProvisioning(accountId: string, wabaId: string): Promise<WabaProvisioningClaim | null> {
+    const account = this.requireAccount(accountId);
+    return this.claimProvisioning(account, validateWabaId(wabaId, "wabaId"), Date.now());
+  }
+
+  async claimPendingWabaProvisioning(limit = PROVISIONING_BATCH): Promise<WabaProvisioningClaim[]> {
+    if (!Number.isInteger(limit) || limit <= 0 || limit > 100) {
+      throw new Error("limit must be an integer between 1 and 100");
+    }
+    const now = Date.now();
+    const rows = this.sql
+      .exec(
+        `SELECT account_id, waba_id, provisioning_revision
+         FROM wabas
+         WHERE status = 'pending'
+           AND provisioning_next_attempt_at <= ?
+           AND (provisioning_lease_until IS NULL OR provisioning_lease_until <= ?)
+           AND substr(meta_access_token, 1, ?) = ?
+         ORDER BY provisioning_next_attempt_at, waba_id
+         LIMIT ?`,
+        now,
+        now,
+        SEALED_TOKEN_PREFIX.length,
+        SEALED_TOKEN_PREFIX,
+        limit,
+      )
+      .toArray() as unknown as ProvisioningRow[];
+    const claims: WabaProvisioningClaim[] = [];
+    for (const row of rows) {
+      const claim = await this.claimProvisioning(row.account_id, row.waba_id, now, row.provisioning_revision);
+      if (claim) claims.push(claim);
+    }
+    return claims;
+  }
+
+  private async claimProvisioning(
+    accountId: string,
+    wabaId: string,
+    now: number,
+    revision?: number,
+  ): Promise<WabaProvisioningClaim | null> {
+    const leaseUntil = now + PROVISIONING_LEASE_MS;
+    const revisionClause = revision === undefined ? "" : " AND provisioning_revision = ?";
+    const revisionArgs = revision === undefined ? [] : [revision];
+    const claimed = this.ctx.storage.transactionSync(() =>
+      this.sql
+        .exec(
+          `UPDATE wabas
+           SET provisioning_attempts = provisioning_attempts + 1,
+               provisioning_next_attempt_at = ?, provisioning_lease_until = ?
+           WHERE account_id = ? AND waba_id = ? AND status = 'pending'
+             AND provisioning_next_attempt_at <= ?
+             AND (provisioning_lease_until IS NULL OR provisioning_lease_until <= ?)
+             ${revisionClause}
+            RETURNING account_id, waba_id, meta_access_token, callback_url, provisioning_attempts,
+                      provisioning_revision, ${COEXISTENCE_COLUMNS}`,
+          leaseUntil,
+          leaseUntil,
+          accountId,
+          wabaId,
+          now,
+          now,
+          ...revisionArgs,
+        )
+        .toArray()[0],
+    );
+    if (!claimed) return null;
+    return {
+      accountId: claimed.account_id as string,
+      wabaId: claimed.waba_id as string,
+      metaAccessToken: await this.decryptStoredToken(
+        claimed.account_id as string,
+        claimed.waba_id as string,
+        claimed.meta_access_token,
+      ),
+      callbackUrl: (claimed.callback_url as string | null) ?? null,
+      phones: phonesOf(wabaId, this.sql),
+      revision: claimed.provisioning_revision as number,
+      attempt: claimed.provisioning_attempts as number,
+      // Derived against the claim's own clock, so the saga step sees the window
+      // as it stands at the moment it is about to act.
+      coexistence: coexistenceOf(claimed, now),
+    };
+  }
+
+  /**
+   * Adopt business phone numbers that appeared on a WABA after it was
+   * registered.
+   *
+   * Embedded Signup v4 lets a customer finish with no phone number, so a
+   * connected WABA can legitimately arrive empty and grow a number later, in
+   * WhatsApp Manager or a second pass of the flow. Without this the saga would
+   * be stuck asserting a fact from the handoff for ever; with it, the ordinary
+   * provisioning retry picks the number up on its own.
+   *
+   * Deliberately *only* fills a gap: it refuses when the WABA already has any
+   * phone, so it can never quietly rewrite the set of numbers an onboarding
+   * established — that remains the registration paths' job, where it is
+   * transactional with the credentials and the coexistence clock. Guarded on
+   * the same lease revision and attempt as the rest of the saga, so a stale
+   * claim cannot write.
+   */
+  async adoptWabaPhones(input: {
+    accountId: string;
+    wabaId: string;
+    revision: number;
+    attempt: number;
+    phones: PhoneRecord[];
+  }): Promise<PhoneRecord[]> {
+    const account = this.requireAccount(input.accountId);
+    const id = validateWabaId(input.wabaId, "wabaId");
+    if (!Number.isSafeInteger(input.revision) || !Number.isSafeInteger(input.attempt)) {
+      throw new Error("invalid provisioning claim");
+    }
+    if (input.phones.length === 0) return [];
+    return this.ctx.storage.transactionSync(() => {
+      const owned = this.sql
+        .exec(
+          `SELECT waba_id FROM wabas
+            WHERE account_id = ? AND waba_id = ? AND status = 'pending'
+              AND provisioning_revision = ? AND provisioning_attempts = ?`,
+          account,
+          id,
+          input.revision,
+          input.attempt,
+        )
+        .toArray();
+      if (owned.length !== 1) return [];
+      // Gap-filling only: a WABA that already has numbers is not this method's
+      // business.
+      if (phonesOf(id, this.sql).length > 0) return [];
+      for (const phone of input.phones) {
+        this.sql.exec(
+          "INSERT OR REPLACE INTO phones (waba_id, phone_number_id, display_phone_number) VALUES (?, ?, ?)",
+          id,
+          phone.phoneNumberId,
+          phone.displayPhoneNumber,
+        );
+      }
+      return phonesOf(id, this.sql);
+    });
+  }
+
+  /**
+   * Record that a coexistence sync is *about to be requested*, before the
+   * request leaves the Worker (eccos-vss).
+   *
+   * Meta allows each sync exactly once per phone number: a second call is error
+   * `2593107` and its documented remedy is offboarding the customer. Writing
+   * after the call would lose the fact whenever the response is lost — a
+   * timeout, an eviction, a dropped connection — and the next attempt would
+   * duplicate it. Writing before means the worst case is a sync recorded but
+   * never sent, whose remedy is the same offboarding and which at least cannot
+   * break a customer whose sync actually succeeded.
+   *
+   * Guarded on the same lease revision and attempt as the rest of the saga, so a
+   * stale claim can never mark a sync spent. Returns false when the guard
+   * rejects, and the caller must not make the call.
+   */
+  async beginCoexistenceSync(input: {
+    accountId: string;
+    wabaId: string;
+    revision: number;
+    attempt: number;
+    syncKind: CoexistenceSyncKind;
+    at: number;
+  }): Promise<boolean> {
+    const account = this.requireAccount(input.accountId);
+    const id = validateWabaId(input.wabaId, "wabaId");
+    if (!Number.isSafeInteger(input.revision) || !Number.isSafeInteger(input.attempt)) {
+      throw new Error("invalid provisioning claim");
+    }
+    if (input.syncKind !== "contacts" && input.syncKind !== "history") {
+      throw new Error("invalid syncKind");
+    }
+    if (!Number.isSafeInteger(input.at)) throw new Error("invalid sync timestamp");
+    const column =
+      input.syncKind === "contacts" ? "contacts_sync_started_at" : "history_sync_started_at";
+    return this.ctx.storage.transactionSync(() => {
+      const updated = this.sql
+        .exec(
+          // `IS NULL` is the once-only guard itself: a sync that has already been
+          // started cannot be started again, whatever the caller believes.
+          `UPDATE wabas
+              SET ${column} = ?
+            WHERE account_id = ? AND waba_id = ? AND status = 'pending'
+              AND provisioning_revision = ? AND provisioning_attempts = ?
+              AND onboarding_type = 'coexistence'
+              AND ${column} IS NULL
+           RETURNING waba_id`,
+          input.at,
+          account,
+          id,
+          input.revision,
+          input.attempt,
+        )
+        .toArray();
+      return updated.length === 1;
+    });
+  }
+
+  async completeWabaProvisioning(input: {
+    accountId: string;
+    wabaId: string;
+    revision: number;
+    attempt: number;
+    success: boolean;
+    failure?: ProvisioningFailure;
+    /**
+     * What the coexistence step managed to initiate during this attempt.
+     * Written in the same guarded transaction as the outcome so a partially
+     * finished sync (contacts through, history not) is never lost by a crash
+     * between two calls — the next attempt would otherwise re-issue a sync Meta
+     * has already accepted (eccos-vss).
+     */
+    coexistence?: CoexistenceSyncProgress;
+  }): Promise<AccountWaba | null> {
+    const account = this.requireAccount(input.accountId);
+    const id = validateWabaId(input.wabaId, "wabaId");
+    if (!Number.isSafeInteger(input.revision) || !Number.isSafeInteger(input.attempt)) {
+      throw new Error("invalid provisioning claim");
+    }
+    const completedAt = Date.now();
+    this.ctx.storage.transactionSync(() => {
+      const current = this.sql
+        .exec(
+          `SELECT status, provisioning_revision, provisioning_attempts, ${COEXISTENCE_COLUMNS}
+           FROM wabas WHERE account_id = ? AND waba_id = ?`,
+          account,
+          id,
+        )
+        .toArray()[0];
+      if (
+        !current ||
+        current.status !== "pending" ||
+        current.provisioning_revision !== input.revision ||
+        current.provisioning_attempts !== input.attempt
+      ) return;
+      if (input.coexistence) {
+        const onboardingType: WabaOnboardingType = isWabaOnboardingType(current.onboarding_type)
+          ? current.onboarding_type
+          : "standard";
+        const deadlineAt = nullableNumber(current.coexistence_sync_deadline_at);
+        // The `*_started_at` columns are owned by `beginCoexistenceSync`, which
+        // wrote them before the request went out; this call only ever adds the
+        // acceptance Meta returned. Request ids move from null to set and never
+        // back, so an attempt that could not reach Meta cannot erase a sync an
+        // earlier attempt already had confirmed.
+        const contactsStartedAt = nullableNumber(current.contacts_sync_started_at);
+        const historyStartedAt = nullableNumber(current.history_sync_started_at);
+        const contactsRequestId =
+          ((current.contacts_sync_request_id as string | null) ?? null) ??
+          input.coexistence.contactsRequestId;
+        const historyRequestId =
+          ((current.history_sync_request_id as string | null) ?? null) ??
+          input.coexistence.historyRequestId;
+        // Sticky in the same way and for the same reason as the request ids:
+        // what Meta already told us about a finished onboarding cannot be
+        // unlearned by a later attempt that failed to ask.
+        const verifiedOnboardingType: WabaOnboardingType | null =
+          (isWabaOnboardingType(current.coexistence_verified_type)
+            ? current.coexistence_verified_type
+            : null) ?? input.coexistence.verifiedOnboardingType;
+        this.sql.exec(
+          `UPDATE wabas
+           SET contacts_sync_request_id = ?, history_sync_request_id = ?,
+               coexistence_verified_type = ?,
+               coexistence_sync_status = ?, coexistence_sync_error = ?
+           WHERE account_id = ? AND waba_id = ?`,
+          contactsRequestId,
+          historyRequestId,
+          verifiedOnboardingType,
+          coexistenceSyncStatus({
+            onboardingType,
+            verifiedOnboardingType,
+            contactsStartedAt,
+            contactsRequestId,
+            historyStartedAt,
+            historyRequestId,
+            deadlineAt,
+            now: completedAt,
+          }),
+          input.coexistence.error,
+          account,
+          id,
+        );
+      }
+      if (input.success) {
+        this.sql.exec(
+          `UPDATE wabas
+           SET status = 'active', provisioning_error = NULL, provisioning_next_attempt_at = 0,
+               provisioning_lease_until = NULL, provisioned_at = ?
+           WHERE account_id = ? AND waba_id = ? AND status = 'pending'
+             AND provisioning_revision = ? AND provisioning_attempts = ?`,
+          completedAt,
+          account,
+          id,
+          input.revision,
+          input.attempt,
+        );
+        return;
+      }
+      const failure = input.failure;
+      if (!failure) throw new Error("provisioning failure details are required");
+      // Waiting for a phone number is not a failing attempt, it is waiting, and
+      // the attempt cap exists to stop something broken from retrying for ever
+      // — not to put a deadline on a customer.
+      //
+      // With the cap applied this dead-ended after six attempts, about 65
+      // minutes: a customer who finished Embedded Signup without a number in
+      // the evening and added it the next morning would find adoption already
+      // stopped, with no way back. The cron only claims `pending` rows, and
+      // Re-check is a per-row button while rows are derived from phone numbers,
+      // so a zero-phone WABA has no row and therefore no button either. That is
+      // the *expected* v4 path, not an edge case.
+      //
+      // So this one kind keeps polling. The backoff is already capped at an
+      // hour, which makes it a slow poll rather than a spin: one
+      // `subscribed_apps` (idempotent) and one `phone_numbers` read per hour per
+      // waiting WABA. The cost is that an abandoned onboarding polls until
+      // somebody deletes it; the cron's batch is ordered by due time, so an
+      // hourly row cannot starve a fresh one.
+      const capReached =
+        input.attempt >= PROVISIONING_MAX_ATTEMPTS && failure.kind !== "awaiting_phone_number";
+      const terminal = !failure.retryable || capReached;
+      this.sql.exec(
+        terminal
+          ? `UPDATE wabas
+             SET status = 'failed', provisioning_error = ?, provisioning_next_attempt_at = 0,
+                 provisioning_lease_until = NULL
+             WHERE account_id = ? AND waba_id = ? AND status = 'pending'
+               AND provisioning_revision = ? AND provisioning_attempts = ?`
+          : `UPDATE wabas
+             SET status = 'pending', provisioning_error = ?, provisioning_next_attempt_at = ?,
+                 provisioning_lease_until = NULL
+             WHERE account_id = ? AND waba_id = ? AND status = 'pending'
+               AND provisioning_revision = ? AND provisioning_attempts = ?`,
+        provisioningErrorMessage(failure),
+        ...(terminal
+          ? [account, id, input.revision, input.attempt]
+          : [completedAt + withProvisioningJitter(provisioningBackoffMs(input.attempt)), account, id, input.revision, input.attempt]),
+      );
+    });
+    return this.getWabaRecord(account, id);
+  }
+
+  /** Everything an account owns, with every credential stripped (no API-key
+   * hashes, no Meta tokens). */
+  listAccountResources(accountId: string): AccountResources {
+    const id = this.requireAccount(accountId);
+    const account = this.sql
+      .exec(
+        "SELECT account_id, name, created_at FROM accounts WHERE account_id = ?",
+        id,
+      )
+      .toArray()[0];
+    if (!account) {
+      return { account: null, keys: [], wabas: [], phones: [] };
+    }
+    const keys = this.keysOf(id);
+    const wabaRows = this.sql
+      .exec(
+        `SELECT w.waba_id, w.callback_url, w.created_at, w.provisioned_at, w.status, w.provisioning_error,
+                ${coexistenceColumnsFor("w")},
+                COALESCE(json_group_array(
+                  json_object('phoneNumberId', p.phone_number_id,
+                              'displayPhoneNumber', p.display_phone_number)), '[]') AS phones
+         FROM wabas w
+         LEFT JOIN phones p ON p.waba_id = w.waba_id
+         WHERE w.account_id = ?
+         GROUP BY w.waba_id, w.callback_url, w.created_at, w.provisioned_at, w.status, w.provisioning_error,
+                  ${coexistenceColumnsFor("w")}
+         ORDER BY w.waba_id`,
+        id,
+      )
+      .toArray();
+    const wabas: WabaAccess[] = wabaRows.map((row) => ({
+      accountId: id,
+      wabaId: row.waba_id as string,
+      callbackUrl: (row.callback_url as string | null) ?? null,
+      createdAt: row.created_at as number,
+      provisionedAt: (row.provisioned_at as number | null) ?? null,
+      status: (row.status as ProvisioningStatus) ?? "active",
+      provisioningError: (row.provisioning_error as string | null) ?? null,
+      phones: parsePhonesJson((row.phones as string | null) ?? "[]"),
+      coexistence: coexistenceOf(row),
+    }));
+    return {
+      account: {
+        accountId: id,
+        name: account.name as string,
+        createdAt: account.created_at as number,
+      },
+      keys,
+      wabas,
+      phones: wabas.flatMap((w) =>
+        w.phones.map((p) => ({ ...p, wabaId: w.wabaId })),
+      ),
+    };
+  }
+
+  /**
+   * Idempotent organization-to-account provisioning saga (contract section 2):
+   * resolves the existing one-to-one link for `organizationId`, or creates the
+   * Eccos account AND the active link atomically inside one DO transaction.
+   * Never issues an API key and never rebinds an existing link; concurrent or
+   * retried calls converge to exactly one account and one link row.
+   */
+  async ensureOrganizationAccount(
+    organizationId: string,
+    name?: string,
+  ): Promise<{ accountId: string; status: "active" | "existing" }> {
+    const orgId = validateOrganizationId(organizationId);
+    const accountName = validateLabel(name ?? null, "name") ?? "";
+    let result: { accountId: string; status: "active" | "existing" } | null = null;
+    this.ctx.storage.transactionSync(() => {
+      const existing = this.sql
+        .exec(
+          "SELECT account_id, status FROM organization_accounts WHERE organization_id = ?",
+          orgId,
+        )
+        .toArray()[0];
+      if (existing) {
+        const status = existing.status as string;
+        // A link exists: never rebind. Only an active link resolves to an account.
+        if (status !== "active") {
+          throw new Error(`organization "${orgId}" link is ${status}; access fails closed`);
+        }
+        result = { accountId: existing.account_id as string, status: "existing" };
+        return;
+      }
+      const accountId = newId("acc");
+      const createdAt = Date.now();
+      this.sql.exec(
+        "INSERT INTO accounts (account_id, name, created_at) VALUES (?, ?, ?)",
+        accountId,
+        accountName,
+        createdAt,
+      );
+      this.sql.exec(
+        "INSERT INTO organization_accounts (organization_id, account_id, status, created_at) VALUES (?, ?, 'active', ?)",
+        orgId,
+        accountId,
+        createdAt,
+      );
+      result = { accountId, status: "active" };
+    });
+    if (!result) throw new Error("organization account provisioning failed");
+    return result;
+  }
+
+  /** Read the one-to-one organization link. `pending`/`disabled` links are
+   * returned as-is so callers fail closed; unknown organizations return null. */
+  getOrganizationAccountLink(
+    organizationId: string,
+  ): { accountId: string; status: "active" | "pending" | "disabled" } | null {
+    const orgId = validateOrganizationId(organizationId);
+    const row = this.sql
+      .exec(
+        "SELECT account_id, status FROM organization_accounts WHERE organization_id = ?",
+        orgId,
+      )
+      .toArray()[0];
+    if (!row) return null;
+    return {
+      accountId: row.account_id as string,
+      status: row.status as "active" | "pending" | "disabled",
+    };
+  }
+
+  /** Organization → active account → resources in one hop (contract §1, §2, §10).
+   * A missing link self-heals through the idempotent saga; a pending/disabled
+   * link or an unconfigured account fails closed. No credential is opened. */
+  async resolveOrganizationContext(organizationId: string): Promise<{ accountId: string; resources: AccountResources }> {
+    let link = this.getOrganizationAccountLink(organizationId);
+    if (!link) {
+      const ensured = await this.ensureOrganizationAccount(organizationId);
+      link = { accountId: ensured.accountId, status: "active" };
+    }
+    if (link.status !== "active") {
+      throw new Error("This organization is not linked to an Eccos account");
+    }
+    const resources = this.listAccountResources(link.accountId);
+    if (!resources.account) throw new Error(`Account "${link.accountId}" is not configured`);
+    return { accountId: link.accountId, resources };
+  }
+
+  purgeExpiredConnectStates(now = Date.now()): void {
+    if (!Number.isFinite(now)) throw new Error("invalid now: expected a finite timestamp");
+    this.sql.exec("DELETE FROM connect_states WHERE expires_at <= ?", now);
+  }
+
+  refreshConnectState(state: string, expiresAt: number): ConnectStateRecord | null {
+    const s = state?.trim() ?? "";
+    if (!s || s.length > STATE_MAX_LENGTH) return null;
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      throw new Error("invalid expiresAt: must be a future timestamp");
+    }
+    const now = Date.now();
+    let result: ConnectStateRecord | null = null;
+    this.ctx.storage.transactionSync(() => {
+      const row = this.sql
+        .exec(
+          "SELECT account_id, expires_at, redirect_uri, return_to FROM connect_states WHERE state = ?",
+          s,
+        )
+        .toArray()[0];
+      if (!row) return;
+      if ((row.expires_at as number) <= now) {
+        this.sql.exec("DELETE FROM connect_states WHERE state = ?", s);
+        return;
+      }
+      this.sql.exec("UPDATE connect_states SET expires_at = ? WHERE state = ?", expiresAt, s);
+      result = connectStateRecord(row);
+    });
+    return result;
+  }
+
+  /** Register a connect state; INSERT OR REPLACE so a retried start wins. */
+  startConnectState(
+    state: string,
+    accountId: string,
+    expiresAt: number,
+    redirectUri?: string,
+    returnTo?: string,
+  ): void {
+    const s = validateState(state);
+    const id = this.requireAccount(accountId);
+    const redirect = validateRedirectUri(redirectUri);
+    const back = validateReturnTo(returnTo);
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      throw new Error("invalid expiresAt: must be a future timestamp");
+    }
+    this.sql.exec(
+      "INSERT OR REPLACE INTO connect_states (state, account_id, expires_at, redirect_uri, return_to) VALUES (?, ?, ?, ?, ?)",
+      s,
+      id,
+      expiresAt,
+      redirect,
+      back,
+    );
+  }
+
+  /** Single-use: returns the account once, then deletes the state. Expired or
+   * unknown states are consumed (deleted) and return null. */
+  consumeConnectState(state: string): string | null {
+    return this.consumeConnectStateRecord(state)?.accountId ?? null;
+  }
+
+  consumeConnectStateForAccount(state: string, accountId: string): ConnectStateRecord | null {
+    const s = state?.trim() ?? "";
+    if (!s || s.length > STATE_MAX_LENGTH) return null;
+    const id = validateAccountId(accountId);
+    const now = Date.now();
+    let result: ConnectStateRecord | null = null;
+    this.ctx.storage.transactionSync(() => {
+      const row = this.sql
+        .exec(
+          "SELECT account_id, expires_at, redirect_uri, return_to FROM connect_states WHERE state = ?",
+          s,
+        )
+        .toArray()[0];
+      if (!row) return;
+      if ((row.expires_at as number) <= now) {
+        this.sql.exec("DELETE FROM connect_states WHERE state = ?", s);
+        return;
+      }
+      if (row.account_id !== id) return;
+      result = connectStateRecord(row);
+      this.sql.exec("DELETE FROM connect_states WHERE state = ?", s);
+    });
+    return result;
+  }
+
+  consumeConnectStateRecord(state: string): ConnectStateRecord | null {
+    const s = state?.trim() ?? "";
+    if (!s || s.length > STATE_MAX_LENGTH) return null;
+    const now = Date.now();
+    let result: ConnectStateRecord | null = null;
+    this.ctx.storage.transactionSync(() => {
+      const row = this.sql
+        .exec(
+          "SELECT account_id, expires_at, redirect_uri, return_to FROM connect_states WHERE state = ?",
+          s,
+        )
+        .toArray()[0];
+      if (!row) return;
+      if ((row.expires_at as number) <= now) {
+        this.sql.exec("DELETE FROM connect_states WHERE state = ?", s);
+        return;
+      }
+      result = connectStateRecord(row);
+      this.sql.exec("DELETE FROM connect_states WHERE state = ?", s);
+    });
+    return result;
+  }
+
+  getConnectStateAccount(state: string): string | null {
+    return this.getConnectState(state)?.accountId ?? null;
+  }
+
+  getConnectState(state: string): ConnectStateRecord | null {
+    const s = state?.trim() ?? "";
+    if (!s || s.length > STATE_MAX_LENGTH) return null;
+    const row = this.sql
+      .exec("SELECT account_id, expires_at, redirect_uri, return_to FROM connect_states WHERE state = ?", s)
+      .toArray()[0];
+    if (!row) return null;
+    if ((row.expires_at as number) <= Date.now()) {
+      this.sql.exec("DELETE FROM connect_states WHERE state = ?", s);
+      return null;
+    }
+    return connectStateRecord(row);
+  }
+
+  /** Cheap liveness probe for readiness checks — no credentials involved. */
+  getHealth(): { ok: true; accounts: number; wabas: number } {
+    const accountRow = this.sql
+      .exec("SELECT COUNT(*) AS c FROM accounts")
+      .toArray()[0];
+    const wabaRow = this.sql
+      .exec("SELECT COUNT(*) AS c FROM wabas")
+      .toArray()[0];
+    return {
+      ok: true,
+      accounts: Number(accountRow?.c ?? 0),
+      wabas: Number(wabaRow?.c ?? 0),
+    };
+  }
+
+  private requireAccount(accountId: string): string {
+    const id = validateAccountId(accountId);
+    const row = this.sql
+      .exec("SELECT account_id FROM accounts WHERE account_id = ?", id)
+      .toArray()[0];
+    if (!row) throw new Error(`account "${id}" does not exist`);
+    return id;
+  }
+
+  /**
+   * Records that Meta refused the message-history sync because history sharing is
+   * off (`2593109`), as the history webhook reports it after the handoff. Only a
+   * coexistence onboarding owes that sync, so any other WABA is left untouched.
+   * Idempotent: applying the same refusal again writes the same row.
+   */
+  markHistorySharingOff(wabaId: string): void {
+    const id = validateWabaId(wabaId, "wabaId");
+    const historyRequestId = syncUnavailableMarker("history_sharing_off");
+    const row = this.sql
+      .exec(
+        `SELECT ${COEXISTENCE_COLUMNS} FROM wabas WHERE waba_id = ? AND onboarding_type = 'coexistence'`,
+        id,
+      )
+      .toArray()[0];
+    if (!row) return;
+    // The status is what the sync state now is, not "unavailable": the contacts sync may still be pending.
+    const { status } = coexistenceOf({ ...row, history_sync_request_id: historyRequestId });
+    this.sql.exec(
+      `UPDATE wabas
+       SET history_sync_request_id = ?, coexistence_sync_status = ?, coexistence_sync_error = ?
+       WHERE waba_id = ? AND onboarding_type = 'coexistence'`,
+      historyRequestId,
+      status,
+      syncUnavailableError({
+        contactsRequestId: (row.contacts_sync_request_id as string | null) ?? null,
+        historyRequestId,
+      }),
+      id,
+    );
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "eccos-test",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-06-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [
+      { "name": "ECCOS", "class_name": "EccosGateway" },
+      { "name": "CONTROL_PLANE", "class_name": "EccosControlPlane" }
+    ]
+  },
+  "r2_buckets": [
+    { "binding": "MEDIA", "bucket_name": "eccos-media-test", "jurisdiction": "eu" }
+  ],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["EccosGateway"] },
+    { "tag": "v2", "new_sqlite_classes": ["EccosControlPlane"] }
+  ],
+  "vars": {
+    "META_GRAPH_VERSION": "v25.0",
+    "META_APP_SECRET": "test-app-secret",
+    "META_WEBHOOK_VERIFY_TOKEN": "test-verify-token",
+    "META_APP_ID": "test-app-id",
+    "META_ES_CONFIG_ID": "test-config-id",
+    "GATEWAY_PUBLIC_URL": "https://gateway.example",
+    "ECCOS_ADMIN_API_KEY": "test-admin-key",
+    // Fake, test-only key material for the control-plane token encryption.
+    "ECCOS_TOKEN_ENCRYPTION_KEY": "test-token-encryption-key-not-a-real-secret",
+    "FORWARD_MAX_ATTEMPTS": "3"
+  }
+}
